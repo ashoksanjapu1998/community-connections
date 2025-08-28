@@ -1,0 +1,215 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Community Connections MVP (API + Lambda + DynamoDB + SNS)
+
+Globals:
+  Function:
+    Runtime: nodejs18.x
+    Timeout: 10
+    MemorySize: 256
+
+Parameters:
+  StageName:
+    Type: String
+    Default: dev
+
+Resources:
+  ############################
+  # Data
+  ############################
+  NeedsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: id, AttributeType: S }
+      KeySchema:
+        - { AttributeName: id, KeyType: HASH }
+      TableName: !Sub "cc-Needs-${StageName}"
+
+  HelpersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: phone, AttributeType: S }
+      KeySchema:
+        - { AttributeName: phone, KeyType: HASH }
+      TableName: !Sub "cc-Helpers-${StageName}"
+
+  ############################
+  # Cognito (helpers sign-in)
+  ############################
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub "cc-mvp-helpers-${StageName}"
+      AutoVerifiedAttributes: ["email"]
+      Schema:
+        - Name: email
+          Required: true
+          Mutable: true
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientName: web-spa
+      AllowedOAuthFlows: ["code"]
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthScopes: ["openid", "email", "profile", "phone"]
+      CallbackURLs:
+        - "http://localhost:5173/auth/callback"
+      LogoutURLs:
+        - "http://localhost:5173/"
+      GenerateSecret: false
+      SupportedIdentityProviders: ["COGNITO"]
+      PreventUserExistenceErrors: ENABLED
+
+  UserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      UserPoolId: !Ref UserPool
+      Domain: !Sub "cc-mvp-${AWS::AccountId}-${AWS::Region}"
+
+  ############################
+  # API (CORS + Authorizer)
+  ############################
+  ApiGateway:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: !Ref StageName
+      Cors:
+        AllowOrigin: "'*'"
+        AllowHeaders: "'*'"
+        AllowMethods: "'GET,POST,OPTIONS'"
+      GatewayResponses:
+        DEFAULT_4XX:
+          ResponseParameters:
+            Headers:
+              Access-Control-Allow-Origin: "'*'"
+              Access-Control-Allow-Headers: "'*'"
+              Access-Control-Allow-Methods: "'*'"
+        DEFAULT_5XX:
+          ResponseParameters:
+            Headers:
+              Access-Control-Allow-Origin: "'*'"
+              Access-Control-Allow-Headers: "'*'"
+              Access-Control-Allow-Methods: "'*'"
+      Auth:
+        AddDefaultAuthorizerToCorsPreflight: false
+        Authorizers:
+          CognitoAuthorizer:
+            UserPoolArn: !GetAtt UserPool.Arn
+            Identity:
+              Header: Authorization
+              ReauthorizeEvery: 0
+
+  ############################
+  # Lambdas + Routes
+  ############################
+  IngestNeedFn:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: lambda/
+      Handler: ingestNeed.handler
+      Environment:
+        Variables:
+          NEEDS_TABLE: !Ref NeedsTable
+          HELPERS_TABLE: !Ref HelpersTable
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref NeedsTable }
+        - DynamoDBReadPolicy: { TableName: !Ref HelpersTable }
+        - Statement:
+            - Effect: Allow
+              Action: ["sns:Publish"]
+              Resource: "*"
+      Events:
+        PostNeeds:               # PUBLIC
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /needs
+            Method: post
+
+  ListNeedsFn:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: lambda/
+      Handler: listNeeds.handler
+      Environment:
+        Variables:
+          NEEDS_TABLE: !Ref NeedsTable
+      Policies:
+        - DynamoDBReadPolicy: { TableName: !Ref NeedsTable }
+      Events:
+        GetNeeds:                # PROTECTED
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /needs
+            Method: get
+            Auth:
+              Authorizer: CognitoAuthorizer
+
+  RegisterHelperFn:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: lambda/
+      Handler: registerHelper.handler
+      Environment:
+        Variables:
+          HELPERS_TABLE: !Ref HelpersTable
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref HelpersTable }
+      Events:
+        PostHelpers:             # PROTECTED
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /helpers
+            Method: post
+            Auth:
+              Authorizer: CognitoAuthorizer
+        OptionsHelpers:          # Preflight
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /helpers
+            Method: options
+
+  AcceptNeedFn:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: lambda/
+      Handler: acceptNeed.handler
+      Environment:
+        Variables:
+          NEEDS_TABLE: !Ref NeedsTable
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref NeedsTable }
+      Events:
+        PostAccept:              # PROTECTED
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /needs/{id}/accept
+            Method: post
+            Auth:
+              Authorizer: CognitoAuthorizer
+        OptionsAccept:           # Preflight
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /needs/{id}/accept
+            Method: options
+
+Outputs:
+  ApiBaseUrl:
+    Value: !Sub "https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/${StageName}"
+  UserPoolId:
+    Value: !Ref UserPool
+  UserPoolClientId:
+    Value: !Ref UserPoolClient
+  CognitoDomain:
+    Value: !Sub "https://${UserPoolDomain}.auth.${AWS::Region}.amazoncognito.com"
